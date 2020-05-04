@@ -22,4 +22,10 @@ ifndef DEBUG
 endif
 
 clean:
-	$(RM) uutunnel
+	$(RM) uutunnel tests *.o
+
+tests: uutunnel.c tests.c
+	cc -DTESTS=1 -Wno-unused-function -g -O0 $(CPPFLAGS) $< -o $@
+
+check: tests
+	./tests

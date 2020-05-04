@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -9,12 +10,18 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
+
+#define SIZEOF_ARRAY(x) (sizeof(x) / sizeof(*(x)))
 
 #define EXHAUST_BANNER "uutunnel, starting exhaust."
 #define EXHAUST_BANNER_LEN strlen(EXHAUST_BANNER)
+
+static bool const debug = false;
 
 static char const *my_binary;
 
@@ -44,6 +51,21 @@ static ssize_t write_all(int fd, char const *buf, size_t sz)
   return 0;
 }
 
+static char *now(void)
+{
+  struct timeval tv;
+  if (0 != gettimeofday(&tv, NULL)) {
+    fprintf(stderr, "Cannot gettimeofday: %s\r\n", strerror(errno));
+    return "ERR: ";
+  }
+  struct tm *tm = localtime(&tv.tv_sec);
+  static char c[] = "23:59:59.999: ";
+  snprintf(c, sizeof(c), "%02d:%02d:%02d.%03d: ",
+    tm->tm_hour, tm->tm_min, tm->tm_sec,
+    (int)(tv.tv_usec / 1000));
+  return c;
+}
+
 #define UPD_MAX_FD(fd) do { if (fd > max_fd) max_fd = fd; } while (0)
 #define IS_SELECTABLE(fd) ((fd) >= 0 && (fd) <= max_fd)
 
@@ -51,39 +73,37 @@ static ssize_t write_all(int fd, char const *buf, size_t sz)
  * Forwarding data from user to shell and vice versa
  */
 
-#define IO_BUF_SIZE 4096
+#define IO_BUF_SIZE (size_t)4096
 static char buffer_from_clt[IO_BUF_SIZE];
 static char buffer_from_srv[IO_BUF_SIZE];
 static size_t from_clt_sz, from_srv_sz;
-// Intermediary buffers with bytes encoded as to survive any terminal:
+/* Intermediary buffers with frames of data from/to the servers, uu-encoded
+ * to survive any terminal: */
 static char buffer_from_clt_enc[IO_BUF_SIZE];
 static char buffer_from_srv_enc[IO_BUF_SIZE];
 static size_t from_clt_enc_sz, from_srv_enc_sz;
 
-#define IS_FULL(sz) ((sz) >= IO_BUF_SIZE)
 #define IS_EMPTY(sz) (0 == (sz))
+#define HAS_ROOM_FOR(x, sz) ((sz) <= IO_BUF_SIZE - (x))
+#define IS_FULL(sz) (! HAS_ROOM_FOR(1, sz))
 
-static int read_into(char *buf, size_t *sz, int *fd)
+static ssize_t read_into(char *buf, size_t *sz, int fd)
 {
   assert(! IS_FULL(*sz));
 
-  ssize_t rd = read(*fd, buf + *sz, IO_BUF_SIZE - *sz);
+  ssize_t rd = read(fd, buf + *sz, IO_BUF_SIZE - *sz);
   if (rd < 0) {
     if (EINTR == errno) return 0;
-    fprintf(stderr, "Cannot read from %d: %s\r\n", *fd, strerror(errno));
-    close_ign(*fd);
-    *fd = -1;
+    fprintf(stderr, "Cannot read from %d: %s\r\n", fd, strerror(errno));
     return -1;
   }
 
   if (rd == 0) {
-    close_ign(*fd);
-    *fd = -1;
     return 0;
   }
 
   *sz += rd;
-  return 0;
+  return rd;
 }
 
 static void buffer_shift(char *buf, size_t *sz, size_t n)
@@ -93,25 +113,14 @@ static void buffer_shift(char *buf, size_t *sz, size_t n)
   memmove(buf, buf + n, *sz);
 }
 
-static void buffer_move(char *restrict src, size_t *restrict src_sz, char *restrict dst, size_t *restrict dst_sz)
-{
-  size_t s = *src_sz;
-  if (s > IO_BUF_SIZE - *dst_sz) s = IO_BUF_SIZE - *dst_sz;
-  memcpy(dst + *dst_sz, src, s);
-  *dst_sz += s;
-  buffer_shift(src, src_sz, s);
-}
-
-static int write_from(char *buf, size_t *sz, int *fd)
+static int write_from(char *buf, size_t *sz, int fd)
 {
   assert(! IS_EMPTY(*sz));
 
-  ssize_t wr = write(*fd, buf, *sz);
+  ssize_t wr = write(fd, buf, *sz);
   if (wr < 0) {
     if (EINTR == errno) return 0;
-    fprintf(stderr, "Cannot write into %d: %s\r\n", *fd, strerror(errno));
-    close_ign(*fd);
-    *fd = -1;
+    fprintf(stderr, "Cannot write into %d: %s\r\n", fd, strerror(errno));
     return -1;
   }
   buffer_shift(buf, sz, wr);
@@ -128,14 +137,16 @@ static int encode_char(int c)
   return c ? (c & 077) + ' ' : '`';
 }
 
+#define UU_LINE_LEN (size_t)45  // must be divisible by 3 and less than 64
+
 static void encode(char *restrict src, size_t *restrict src_sz, char *restrict dst, size_t *restrict dst_sz)
 {
   size_t i = 0;
   while (i < *src_sz) {
-    // lines up to 45 chars in length
+    // lines up to UU_LINE_LEN chars in length
     size_t n = *src_sz - i;
-    if (n > 45) n = 45;
-    // for each 3 chars we output 4, +1 prefix and newline:
+    if (n > UU_LINE_LEN) n = UU_LINE_LEN;
+    // for every 3 chars we output 4, +1 prefix and newline:
     if (1 + 4 * ((n + 2) / 3) + 1 > IO_BUF_SIZE - *dst_sz)
       break; // wait
 
@@ -164,18 +175,25 @@ static char decode_char(int c)
   return (c - ' ') & 077;
 }
 
-static void decode(char *restrict src, size_t *restrict src_sz, char *restrict dst, size_t *restrict dst_sz)
+static void decode(
+  char *restrict src, // source buffer
+  size_t src_stop,  // do not decode past that point
+  size_t *restrict src_sz,  // end of source buffer (>= src_stop)
+  char *restrict dst,  // dst buffer
+  size_t *restrict dst_sz)  // size of dest buffer
 {
   size_t i;
-  for (i = 0; i < *src_sz; ) {
+  for (i = 0; i < src_stop; ) {
     // First char is the line length
     ssize_t n = decode_char(src[i]);
-    assert(n > 0 && n <= 45);
+    assert(n > 0 && n <= (ssize_t)UU_LINE_LEN);
+
+    if (*dst_sz + n > IO_BUF_SIZE) break;
 
     /* Since the padding is sent with the data, we must have that length after
      * the prefix, plus the newline: */
     size_t expected = 4 * ((n + 2) / 3);
-    if (i + 1 + expected + 1 > *src_sz) break;
+    if (i + 1 + expected + 1 > src_stop) break;
     i++;
 
     while (n > 0) {
@@ -198,6 +216,168 @@ static void decode(char *restrict src, size_t *restrict src_sz, char *restrict d
   }
 
   buffer_shift(src, src_sz, i);
+}
+
+/*
+ * Connections and frames
+ */
+
+#define NUM_MAX_CNXS 100  // must be below 65536
+
+static struct cnx {
+  int fd; // <= 0 if this cnx is free (thus statically initialized to free)
+  size_t from_clt_sz, from_srv_sz;
+  bool is_new;
+  // Fins are signaled via an empty frame
+  bool fin_clt, fin_srv, fin_clt_sent, fin_srv_sent;
+  char from_clt[IO_BUF_SIZE];
+  char from_srv[IO_BUF_SIZE];
+} cnxs[NUM_MAX_CNXS];
+
+static struct cnx *cnx_new(void)
+{
+  for (size_t i = 0; i < NUM_MAX_CNXS; i++) {
+    struct cnx *cnx = cnxs + i;
+
+    if (cnx->fd <= 0) {
+      cnx->from_clt_sz = cnx->from_srv_sz = 0;
+      cnx->is_new = true;
+      cnx->fin_clt = cnx->fin_srv = cnx->fin_clt_sent = cnx->fin_srv_sent = false;
+      return cnx;
+    }
+  }
+
+  return NULL;
+}
+
+static void cnx_del(struct cnx *cnx)
+{
+  close_ign(cnx->fd);
+  cnx->fd = -1;
+}
+
+static struct cnx *cnx_new_to_server(struct sockaddr_in *addr)
+{
+  struct cnx *cnx = cnx_new();
+  if (! cnx) return NULL;
+
+  int fd = socket(PF_INET, SOCK_STREAM, 0);
+  if (-1 == fd) {
+    fprintf(stderr, "Cannot socket: %s\n", strerror(errno));
+    return NULL;
+  }
+  if (0 != connect(fd, (struct sockaddr *)addr, sizeof(*addr))) {
+    fprintf(stderr, "Cannot connect: %s\n", strerror(errno));
+    return NULL;
+  }
+  cnx->fd = fd;
+  return cnx;
+}
+
+static struct cnx *cnx_new_from_client(int fd)
+{
+  struct cnx *cnx = cnx_new();
+  cnx->fd = fd;
+  return cnx;
+}
+
+// Assuming 4 chars can be read
+static uint16_t peek_hex(char *src)
+{
+  uint16_t ret = 0;
+  for (size_t i = 0; i < 4; i++) {
+    ret <<= 4;
+    if (src[i] >= 'A' && src[i] <= 'F') ret += 10 + src[i] - 'A';
+    else ret += src[i] - '0';
+  }
+  return ret;
+}
+
+static void poke_hex(char *dst, uint16_t v)
+{
+  size_t i = 4;
+  while (i--) {
+    char c = v & 0xF;
+    if (c < 10) dst[i] = '0' + c;
+    else dst[i] = 'A' + (c - 10);
+    v >>= 4;
+  }
+}
+
+/* Frames have a header made of the length (excluding the header itself,
+ * 16 bits) and the cnx number (16 bits) both encoded as hexadecimal, and
+ * followed by a newline to flush even an empty frame. */
+#define FRAME_HEAD_LEN 9
+
+/* decode() will not write full lines unless at the end of the source buffer.
+ * Therefore we must not start a frame unless we have enough room for a full
+ * uu-encoded line, which is UU_LINE_LEN * 4 / 3 + 2. Also keeps the header
+ * overhead small: */
+#define MIN_FRAME_LEN (size_t)(UU_LINE_LEN * 4 / 3 + 2)
+
+/* Encode as much as possible from src that will fit in the dst buffer once
+ * uuencoded. Every single byte of input must go, but we wait until we have
+ * enough room in the dst buffer before departure.
+ * Actually, even 0 bytes from input must go (as an empty frame) to signal
+ * opens and closes.
+ * Return the size of the frame that was sent, or -1. */
+static ssize_t try_encode_frame(
+  size_t cnx_i, char *restrict src, size_t *restrict src_sz,
+  char *restrict dst, size_t *restrict dst_sz)
+{
+  if (! HAS_ROOM_FOR(FRAME_HEAD_LEN + MIN_FRAME_LEN, *dst_sz)) return -1;
+
+  assert(cnx_i <= NUM_MAX_CNXS);
+
+  char *header = dst + *dst_sz;
+  *dst_sz += FRAME_HEAD_LEN;
+  size_t start_frame = *dst_sz;
+  encode(src, src_sz, dst, dst_sz);
+  size_t frame_sz = *dst_sz - start_frame;
+  poke_hex(header, frame_sz);
+  poke_hex(header+4, cnx_i);
+  header[FRAME_HEAD_LEN-1] = '\n';
+
+  return frame_sz;
+}
+
+// returns true if a frame was decoded
+static bool try_decode_frame(char *src, size_t *restrict src_sz, size_t *restrict len, size_t *restrict recpt, bool from_clt)
+{
+  // Leave the header in the buffer until the whole frame can be read:
+  if (*src_sz < FRAME_HEAD_LEN) return false;
+
+  *len = peek_hex(src);
+  *recpt = peek_hex(src + 4);
+  assert(src[FRAME_HEAD_LEN-1] == '\n');
+  assert(*recpt < NUM_MAX_CNXS);
+
+  // Wait until the whole frame is available:
+  if (*src_sz < FRAME_HEAD_LEN + *len) return false;
+
+  struct cnx *cnx = cnxs + *recpt;
+
+  if (cnx->fd <= 0) {
+    // Drop the frame
+    buffer_shift(src, src_sz, FRAME_HEAD_LEN + *len);
+    return true;
+  } else if (! HAS_ROOM_FOR(*len, from_clt ? cnx->from_clt_sz : cnx->from_srv_sz)) {
+    // Have to wait some more
+    return false;
+  } else {
+    buffer_shift(src, src_sz, FRAME_HEAD_LEN);
+    // Decode not further than the end of the frame:
+    size_t const src_sz_ = *src_sz - *len;
+    if (from_clt)
+      decode(src, *len, src_sz,
+             cnx->from_clt, &cnx->from_clt_sz);
+    else
+      decode(src, *len, src_sz,
+             cnx->from_srv, &cnx->from_srv_sz);
+    assert(*src_sz == src_sz_);
+
+    return true;
+  }
 }
 
 /*
@@ -357,18 +537,12 @@ errchld:
  * Network intake
  */
 
-static struct client {
-  int fd;
-  size_t from_clt_sz, from_srv_sz;
-  size_t from_clt_enc_sz, from_srv_enc_sz;
-  char from_clt[IO_BUF_SIZE];
-  char from_srv[IO_BUF_SIZE];
-  char from_clt_enc[IO_BUF_SIZE];
-  char from_srv_enc[IO_BUF_SIZE];
-} client;
-
-static int intake_end(unsigned short port, int *ptmfd)
+static int intake(unsigned short port, int *ptmfd)
 {
+  // The global input buffer must be empty at this point:
+  assert(IS_EMPTY(from_srv_sz));
+  assert(IS_EMPTY(from_srv_enc_sz));
+
   int sock = socket(AF_INET, SOCK_STREAM, 0);
   if (sock < 0) {
     fprintf(stderr, "Cannot socket: %s\r\n", strerror(errno));
@@ -403,17 +577,6 @@ static int intake_end(unsigned short port, int *ptmfd)
     return -1;
   }
 
-  client.fd = -1;
-  client.from_clt_sz = client.from_srv_sz = 0;
-  client.from_clt_enc_sz = client.from_srv_enc_sz = 0;
-  /* The client should get whatever is left on the global input buffer, that
-   * the server might have written spontaneously before we even called
-   * intake_end(): */
-  if (! IS_EMPTY(from_srv_sz)) {
-    // This has been encoded
-    buffer_move(buffer_from_srv, &from_srv_sz, client.from_srv_enc, &client.from_srv_enc_sz);
-  }
-
   // Event loop
   while (*ptmfd >= 0) {
     fd_set rset, wset;
@@ -421,28 +584,83 @@ static int intake_end(unsigned short port, int *ptmfd)
     FD_ZERO(&wset);
     int max_fd = -1;
 
-    if (sock >= 0 && client.fd < 0) {
+    /* Due to the intermediary buffers, the select can hang in two situations:
+     * - any client from_clt buffer not empty, while buffer_from_clt_enc is
+     *   empty, in which case the select will block until next reception, and
+     * - buffer_from_srv_enc not empty while all client from_srv buffers are
+     *   empty, in which case again the select will block until next reception.
+     * To avoid the former case, we select the ttyp for writing as soon as any
+     * client has a non empty from_clt. And to avoid the later we decode frames
+     * into clients from_srv buffers last. */
+
+    if (sock >= 0) {
       FD_SET(sock, &rset);
       UPD_MAX_FD(sock);
     }
 
-    if (client.fd >= 0 && ! IS_FULL(client.from_clt_sz)) {
-      FD_SET(client.fd, &rset);
-      UPD_MAX_FD(client.fd);
-    }
-    if (client.fd >= 0 && ! IS_EMPTY(client.from_srv_sz)) {
-      FD_SET(client.fd, &wset);
-      UPD_MAX_FD(client.fd);
+    for (size_t i = 0; i < NUM_MAX_CNXS; i++) {
+      struct cnx *client = cnxs + i;
+
+      int fd = client->fd;
+      if (fd <= 0) continue;
+
+      if (client->fin_clt && !client->fin_clt_sent) {
+        // Wait until all have been sent and then add an empty frame:
+        if (IS_EMPTY(client->from_clt_sz)) {
+          if (debug) fprintf(stderr, "%sPropagating FIN to server for client %zu.\r\n", now(), i);
+          ssize_t frame_sz =
+            try_encode_frame(i, client->from_clt, &client->from_clt_sz,
+                                buffer_from_clt_enc, &from_clt_enc_sz);
+          if (frame_sz == 0) client->fin_clt_sent = true;
+        }
+      }
+      if (client->fin_srv && !client->fin_srv_sent) {
+        if (IS_EMPTY(client->from_srv_sz)) {
+          if (debug) fprintf(stderr, "%sPropaganting FIN to client %zu.\r\n", now(), i);
+          if (0 != shutdown(client->fd, SHUT_WR)) {
+            fprintf(stderr, "Cannot shutdown: %s.\r\n", strerror(errno));
+            // So be it
+          }
+          client->fin_srv_sent = true;
+        }
+      }
+      if (client->fin_clt_sent && client->fin_srv_sent) {
+        if (debug) fprintf(stderr, "%sDisconnecting client %zu.\r\n", now(), i);
+        cnx_del(client);
+        continue;
+      }
+
+      // Avoid reading the EOF repeatedly, or anything else, when fin_clt:
+      if (! IS_FULL(client->from_clt_sz) && ! client->fin_clt) {
+        FD_SET(fd, &rset);
+        UPD_MAX_FD(fd);
+      }
+      if (! IS_EMPTY(client->from_srv_sz) && ! client->fin_srv_sent) {
+        FD_SET(fd, &wset);
+        UPD_MAX_FD(fd);
+      }
+      /* For new clients we will want to write an empty frame (only when that
+       * empty frame is encoded shall the is_new flag be cleared).
+       * In addition, we want to write in ptmfd even if from_clt_enc is
+       * currently empty as soon as at least one of the client from_clt is
+       * not empty. */
+      if (client->is_new || ! IS_EMPTY(client->from_clt_sz)) {
+        FD_SET(*ptmfd, &wset);
+        UPD_MAX_FD(*ptmfd);
+      }
     }
 
-    if (! IS_FULL(client.from_srv_enc_sz)) {
+    if (! IS_FULL(from_srv_enc_sz)) {
       FD_SET(*ptmfd, &rset);
       UPD_MAX_FD(*ptmfd);
     }
-    if (! IS_EMPTY(client.from_clt_enc_sz)) {
+    if (! IS_EMPTY(from_clt_enc_sz)) {
       FD_SET(*ptmfd, &wset);
       UPD_MAX_FD(*ptmfd);
     }
+    /* It is not possible that from_srv_enc to be not empty and the recipient
+     * of the waiting frame to be empty (because we decode frames last).
+     * Therefore we cannot hang in the select. */
 
     int num_fds = select(max_fd + 1, &rset, &wset, NULL, NULL);
     if (num_fds < 0) {
@@ -453,41 +671,83 @@ static int intake_end(unsigned short port, int *ptmfd)
 
     if (0 == num_fds) continue;
 
-    if (IS_SELECTABLE(client.fd) && FD_ISSET(client.fd, &rset)) {
-      read_into(client.from_clt, &client.from_clt_sz, &client.fd);
-    }
-    if (IS_SELECTABLE(client.fd) && FD_ISSET(client.fd, &wset)) {
-      write_from(client.from_srv, &client.from_srv_sz, &client.fd);
+    for (size_t i = 0; i < NUM_MAX_CNXS; i++) {
+      struct cnx *client = cnxs + i;
+      int fd = client->fd;
+
+      if (fd <= 0) continue;
+
+      if (client->is_new) {
+        ssize_t frame_sz =
+          try_encode_frame(i, client->from_clt, &client->from_clt_sz,
+                              buffer_from_clt_enc, &from_clt_enc_sz);
+        if (frame_sz < 0) break;
+        client->is_new = false;
+        if (debug) fprintf(stderr, "%sclient[%zd], wrote the initial empty frame.\r\n", now(), i);
+      }
+
+      if (! client->is_new && IS_SELECTABLE(fd) && FD_ISSET(fd, &rset)) {
+        ssize_t rs = read_into(client->from_clt, &client->from_clt_sz, client->fd);
+        if (debug) fprintf(stderr, "%sclient[%zd] received %zd bytes from client, from_clt_sz = %zu.\r\n", now(), i, rs, client->from_clt_sz);
+        if (rs <= 0) client->fin_clt = true;
+      }
+      if (IS_SELECTABLE(fd) && FD_ISSET(fd, &wset)) {
+        if (write_from(client->from_srv, &client->from_srv_sz, client->fd) < 0) {
+          cnx_del(client);
+          continue;
+        }
+        if (debug) fprintf(stderr, "%sclient[%zd] receiving from server, from_srv_sz = %zu.\r\n", now(), i, client->from_srv_sz);
+      }
+
+      // Encode (but wait for new clients to have queued the empty frame first)
+      if (! client->is_new && ! IS_EMPTY(client->from_clt_sz)) {
+        if (debug) fprintf(stderr, "%sclient[%zd], client->from_clt_sz = %zu, buffer_from_clt_enc_sz = %zu.\r\n", now(), i, client->from_clt_sz, from_clt_enc_sz);
+        ssize_t frame_sz =
+          try_encode_frame(i, client->from_clt, &client->from_clt_sz,
+                              buffer_from_clt_enc, &from_clt_enc_sz);
+        if (frame_sz < 0) break;
+        client->is_new = false;
+        if (debug) fprintf(stderr, "%sclient[%zd], wrote a frame of %zd bytes, from_clt_enc_sz = %zu.\r\n", now(), i, frame_sz, from_clt_enc_sz);
+      }
     }
 
-    if (IS_SELECTABLE(*ptmfd) && FD_ISSET(*ptmfd, &rset)) {
-      if (0 != read_into(client.from_srv_enc, &client.from_srv_enc_sz, ptmfd)) break;
-    }
+    // Write to tty:
     if (IS_SELECTABLE(*ptmfd) && FD_ISSET(*ptmfd, &wset)) {
-      if (0 != write_from(client.from_clt_enc, &client.from_clt_enc_sz, ptmfd)) break;
+      if (debug) fprintf(stderr, "%stty: is writable, from_clt_enc_sz = %zu.\r\n", now(), from_clt_enc_sz);
+      if (write_from(buffer_from_clt_enc, &from_clt_enc_sz, *ptmfd) < 0) break;
+      if (debug) fprintf(stderr, "%stty: writing, from_clt_enc_sz = %zu.\r\n", now(), from_clt_enc_sz);
     }
 
-    // Encode/decode
-    if (! IS_EMPTY(client.from_srv_enc_sz) && ! IS_FULL(client.from_srv_sz))
-      decode(client.from_srv_enc, &client.from_srv_enc_sz, client.from_srv, &client.from_srv_sz);
-    if (! IS_EMPTY(client.from_clt_sz) && ! IS_FULL(client.from_clt_enc_sz))
-      encode(client.from_clt, &client.from_clt_sz, client.from_clt_enc, &client.from_clt_enc_sz);
+    // Read from tty:
+    if (IS_SELECTABLE(*ptmfd) && FD_ISSET(*ptmfd, &rset)) {
+      if (read_into(buffer_from_srv_enc, &from_srv_enc_sz, *ptmfd) <= 0) break;
+      if (debug) fprintf(stderr, "%stty: reading, from_srv_enc_sz = %zu.\r\n", now(), from_srv_enc_sz);
+    }
 
-    // Must come after because client.fd may be changed:
+    // Decode:
+    while (true) {
+      size_t frame_sz, i;
+      if (! try_decode_frame(buffer_from_srv_enc, &from_srv_enc_sz, &frame_sz, &i, false)) break;
+      if (debug) fprintf(stderr, "%sDecoded a frame of %zu bytes for client %zu.\r\n", now(), frame_sz, i);
+      assert(i < NUM_MAX_CNXS);
+      if (frame_sz == 0) cnxs[i].fin_srv = true;
+    }
+
+    // Accept new connections:
     if (IS_SELECTABLE(sock) && FD_ISSET(sock, &rset)) {
       int fd = accept(sock, NULL, NULL);
       if (fd < 0) {
         fprintf(stderr, "Cannot accept: %s\r\n", strerror(errno));
         continue; // too bad
       }
-      if (client.fd >= 0) {
+      struct cnx *client = cnx_new_from_client(fd);
+      if (! client) {
         fprintf(stderr, "Cannot accept: unfortunately we are fully booked at the moment.\r\n");
         close_ign(fd);
         continue;
       }
-      client.fd = fd;
       // We may already have content for her
-      fprintf(stderr, "New client accepted (with %zu bytes of content already)!\r\n", client.from_srv_sz);
+      fprintf(stderr, "%sNew client accepted!\r\n", now());
     }
   }
 
@@ -498,8 +758,17 @@ static int intake_end(unsigned short port, int *ptmfd)
  * Network exhaust
  */
 
-static int exhaust_end(unsigned short port)
+static int exhaust(unsigned short port)
 {
+  FILE *log = NULL;
+  if (debug) {
+    char fname[PATH_MAX];
+    snprintf(fname, sizeof(fname), "/tmp/uutunnel.%d.log", getpid());
+    log = fopen(fname, "w+");
+    if (! log) abort();
+    fprintf(log, "UUTunnel, exhaust side, logging...\n");
+  }
+
   // Where to connect to:
   struct sockaddr_in addr;
   bzero(&addr, sizeof(addr));
@@ -507,40 +776,77 @@ static int exhaust_end(unsigned short port)
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-  // All those may be closed by read_into/write_from:
-  int fd = -1;  // reconnect on demand
   int stdin_fileno = STDIN_FILENO;
   int stdout_fileno = STDOUT_FILENO;
 
   while (true) {
-    if (fd < 0) {
-      fd = socket(PF_INET, SOCK_STREAM, 0);
-      if (-1 == fd) {
-        fprintf(stderr, "Cannot socket: %s\n", strerror(errno));
-        return -1;
-      }
-      if (0 != connect(fd, (struct sockaddr *)&addr, sizeof(addr))) {
-        fprintf(stderr, "Cannot connect: %s\n", strerror(errno));
-        return -1;
-      }
-    }
-
     fd_set rset, wset;
     int max_fd = -1;
     FD_ZERO(&rset);
     FD_ZERO(&wset);
 
-    if (fd >= 0 && ! IS_FULL(from_srv_sz)) {
-      FD_SET(fd, &rset);
-      UPD_MAX_FD(fd);
+    /* Similarly to the intake case, we must not enter the select in any of
+     * those two cases:
+     * - buffer_from_clt_enc non empty but all clients from_clt buffers empty;
+     * - some clients from_srv buffer non empty but buffer_from_srv_enc empty.
+     * To avoid the former case we decode frames last. And to avoid the later
+     * we select tty for writing as soon as a clients from_srv is not empty. */
+
+    for (size_t i = 0; i < NUM_MAX_CNXS; i++) {
+      struct cnx *cnx = cnxs + i;
+      int fd = cnx->fd;
+      if (fd <= 0) continue;
+
+      if (cnx->fin_srv && !cnx->fin_srv_sent) {
+        // Wait until all have been sent and then add an empty frame:
+        if (IS_EMPTY(cnx->from_srv_sz)) {
+          if (log) fprintf(log, "%sPropagating FIN to client for cnx %zu.\n", now(), i);
+          ssize_t frame_sz =
+            try_encode_frame(i, cnx->from_srv, &cnx->from_srv_sz,
+                                buffer_from_srv_enc, &from_srv_enc_sz);
+          if (frame_sz == 0) cnx->fin_srv_sent = true;
+        }
+      }
+
+      if (cnx->fin_clt && !cnx->fin_clt_sent) {
+        if (IS_EMPTY(cnx->from_clt_sz)) {
+          if (log) fprintf(log, "%sPropagating FIN to server for cnx %zu.\n", now(), i);
+          if (0 != shutdown(cnx->fd, SHUT_WR)) {
+            if (log) fprintf(log, "%sCannot shutdown: %s.\n", now(), strerror(errno));
+          }
+          cnx->fin_clt_sent = true;
+        }
+      }
+
+      /* Actual disconnection happens only when we have seen and propagated
+       * both FINs.
+       * Beware that if we have already sent the empty frame to the client, and
+       * we just shutdown the connection to the server, then we are not going to
+       * select anything from this client, so let's delete the cnx right here: */
+      if (cnx->fin_srv_sent && cnx->fin_clt_sent && IS_EMPTY(cnx->from_srv_sz)) {
+        if (log) fprintf(log, "%sDestroying connection %zu.\n", now(), i);
+        cnx_del(cnx);
+        continue;
+      }
+
+      // Avoids reading EOF repeatedly nor anything else once cnx->fin_srv:
+      if (! IS_FULL(cnx->from_srv_sz) && !cnx->fin_srv) {
+        FD_SET(fd, &rset);
+        UPD_MAX_FD(fd);
+      }
+      if (! IS_EMPTY(cnx->from_clt_sz) && !cnx->fin_clt_sent) {
+        FD_SET(fd, &wset);
+        UPD_MAX_FD(fd);
+      }
+      if (! IS_EMPTY(cnx->from_srv_sz)) {
+        FD_SET(stdout_fileno, &wset);
+        UPD_MAX_FD(stdout_fileno);
+      }
     }
+
     if (stdin_fileno >= 0 && ! IS_FULL(from_clt_enc_sz)) {
       FD_SET(stdin_fileno, &rset);
       UPD_MAX_FD(stdin_fileno);
-    }
-    if (fd >= 0 && ! IS_EMPTY(from_clt_sz)) {
-      FD_SET(fd, &wset);
-      UPD_MAX_FD(fd);
     }
     if (! IS_EMPTY(from_srv_enc_sz)) {
       FD_SET(stdout_fileno, &wset);
@@ -548,6 +854,8 @@ static int exhaust_end(unsigned short port)
     }
 
     assert(max_fd >= 0);
+
+    if (log) fflush(log);
 
     int num_fds = select(max_fd + 1, &rset, &wset, NULL, NULL);
     if (num_fds < 0) {
@@ -558,21 +866,66 @@ static int exhaust_end(unsigned short port)
 
     if (0 == num_fds) continue;
 
-    if (IS_SELECTABLE(fd) && FD_ISSET(fd, &rset))
-      if (0 != read_into(buffer_from_srv, &from_srv_sz, &fd)) break;
-    if (IS_SELECTABLE(stdin_fileno) && FD_ISSET(stdin_fileno, &rset))
-      if (0 != read_into(buffer_from_clt_enc, &from_clt_enc_sz, &stdin_fileno)) break;
-    if (IS_SELECTABLE(fd) && FD_ISSET(fd, &wset))
-      if (0 != write_from(buffer_from_clt, &from_clt_sz, &fd)) break;
-    if (IS_SELECTABLE(stdout_fileno) && FD_ISSET(stdout_fileno, &wset))
-      if (0 != write_from(buffer_from_srv_enc, &from_srv_enc_sz, &stdout_fileno)) break;
+    for (size_t i = 0; i < NUM_MAX_CNXS; i++) {
+      struct cnx *cnx = cnxs + i;
+      if (cnx->fd <= 0) continue;  // Important because 0 IS_SELECTABLE
 
-    // Encode/decode
-    if (! IS_EMPTY(from_clt_enc_sz) && ! IS_FULL(from_clt_sz))
-      decode(buffer_from_clt_enc, &from_clt_enc_sz, buffer_from_clt, &from_clt_sz);
-    if (! IS_EMPTY(from_srv_sz) && ! IS_FULL(from_srv_enc_sz))
-      encode(buffer_from_srv, &from_srv_sz, buffer_from_srv_enc, &from_srv_enc_sz);
+      if (IS_SELECTABLE(cnx->fd) && FD_ISSET(cnx->fd, &rset)) {
+        ssize_t rs = read_into(cnx->from_srv, &cnx->from_srv_sz, cnx->fd);
+        if (log) fprintf(log, "%scnx[%zu] receiving, from_srv_sz = %zu.\n", now(), i, cnx->from_srv_sz);
+        if (rs <= 0) cnx->fin_srv = true;
+      }
+      if (IS_SELECTABLE(cnx->fd) && FD_ISSET(cnx->fd, &wset)) {
+        if (write_from(cnx->from_clt, &cnx->from_clt_sz, cnx->fd) < 0) break;
+        if (log) fprintf(log, "%scnx[%zu] sending, from_srv_sz = %zu.\n", now(), i, cnx->from_srv_sz);
+      }
+
+      /* Encode. Notice first connections will starve later ones.
+       * FIXME by iterating starting at a random offset. */
+      if (! IS_EMPTY(cnx->from_srv_sz)) {
+        if (log) fprintf(log, "%scnx[%zd], cnx->from_srv_sz = %zu, buffer_from_srv_enc_sz = %zu.\n", now(), i, cnx->from_srv_sz, from_srv_enc_sz);
+        ssize_t frame_sz =
+          try_encode_frame(i, cnx->from_srv, &cnx->from_srv_sz,
+                              buffer_from_srv_enc, &from_srv_enc_sz);
+        if (frame_sz < 0) break;
+        if (log) fprintf(log, "%sWrote a frame of %zd bytes, from_srv_enc_sz = %zu.\r\n", now(), frame_sz, from_srv_enc_sz);
+      }
+    }
+
+    // Write uu-encoded to stdout:
+    if (IS_SELECTABLE(stdout_fileno) && FD_ISSET(stdout_fileno, &wset)) {
+      if (write_from(buffer_from_srv_enc, &from_srv_enc_sz, stdout_fileno) < 0) break;
+      if (log) fprintf(log, "%sWriting to stdout, from_srv_enc_sz = %zd.\n", now(), from_srv_enc_sz);
+    }
+
+    // Read uu-encoded data from stdin:
+    if (IS_SELECTABLE(stdin_fileno) && FD_ISSET(stdin_fileno, &rset)) {
+      if (log) fprintf(log, "%sStdint is selectable, from_clt_enc_sz = %zd.\n", now(), from_clt_enc_sz);
+      if (read_into(buffer_from_clt_enc, &from_clt_enc_sz, stdin_fileno) <= 0) break;
+      if (log) fprintf(log, "%sReading from stdin, from_clt_enc_sz = %zd.\n", now(), from_clt_enc_sz);
+    }
+
+    // Decode the next frame if it's complete:
+    while (true) {
+      if (log) fprintf(log, "%sTrying to decode a frame, from_clt_enc_sz = %zu.\n", now(), from_clt_enc_sz);
+      if (log && from_clt_enc_sz >= FRAME_HEAD_LEN)
+        fprintf(log, "%sHeader: '%.8s'\n", now(), buffer_from_clt_enc);
+      size_t frame_sz, i;
+      if (! try_decode_frame(buffer_from_clt_enc, &from_clt_enc_sz, &frame_sz, &i, true)) break;
+      if (log) fprintf(log, "%sDecoded a frame of %zu bytes from client %zu.\n", now(), frame_sz, i);
+      assert(i < NUM_MAX_CNXS);
+
+      if (cnxs[i].fd <= 0) {
+        assert(frame_sz == 0);
+        (void)cnx_new_to_server(&addr);
+        if (log) fprintf(log, "%sNew connection to localhost:%d\n", now(), port);
+      } else if (frame_sz == 0) {
+        cnxs[i].fin_clt = true;
+      }
+    }
   }
+
+  if (log) fclose(log);
 
   return -1;
 }
@@ -705,7 +1058,7 @@ static int write_and_scan_from(char *buf, size_t *sz, int *fd, struct magic_seq 
         } else {
           seq->completed = true;
           buffer_shift(buf, sz, i);
-          fprintf(stderr, "Peered! Forwarding port...\r\n");
+          fprintf(stderr, "%sPeered! Forwarding port...\r\n", now());
           return 0;
         }
       }
@@ -719,24 +1072,28 @@ no_match:;
     }
   }
 
-  return write_from(buf, sz, fd);
+  return write_from(buf, sz, *fd);
 }
 
 static int dig_tunnel(unsigned short port)
 {
-  // Debug copies:
-  seq_from_srv.fd_copy =
-    open("/tmp/from_srv.log", O_CREAT|O_TRUNC|O_WRONLY, 0640);
-  if (seq_from_srv.fd_copy < 0) {
-    fprintf(stderr, "Cannot open logfile: %s\n", strerror(errno));
-    return -1;
-  }
+  if (debug) {
+    // Debug copies:
+    seq_from_srv.fd_copy =
+      open("/tmp/from_srv.log", O_CREAT|O_TRUNC|O_WRONLY, 0640);
+    if (seq_from_srv.fd_copy < 0) {
+      fprintf(stderr, "Cannot open logfile: %s\n", strerror(errno));
+      return -1;
+    }
 
-  seq_from_clt.fd_copy =
-    open("/tmp/from_clt.log", O_CREAT|O_TRUNC|O_WRONLY, 0640);
-  if (seq_from_clt.fd_copy < 0) {
-    fprintf(stderr, "Cannot open logfile: %s\n", strerror(errno));
-    return -1;
+    seq_from_clt.fd_copy =
+      open("/tmp/from_clt.log", O_CREAT|O_TRUNC|O_WRONLY, 0640);
+    if (seq_from_clt.fd_copy < 0) {
+      fprintf(stderr, "Cannot open logfile: %s\n", strerror(errno));
+      return -1;
+    }
+  } else {
+    seq_from_srv.fd_copy = seq_from_clt.fd_copy = -1;
   }
 
   // All those may be closed by read_into/write_from:
@@ -782,90 +1139,27 @@ static int dig_tunnel(unsigned short port)
     if (0 == num_fds) continue;
 
     if (IS_SELECTABLE(ptmfd) && FD_ISSET(ptmfd, &rset))
-      if (0 != read_into(buffer_from_srv, &from_srv_sz, &ptmfd)) break;
+      if (read_into(buffer_from_srv, &from_srv_sz, ptmfd) <= 0) break;
     if (IS_SELECTABLE(stdin_fileno) && FD_ISSET(stdin_fileno, &rset))
-      if (0 != read_into(buffer_from_clt, &from_clt_sz, &stdin_fileno)) break;
+      if (read_into(buffer_from_clt, &from_clt_sz, stdin_fileno) <= 0) break;
     if (IS_SELECTABLE(ptmfd) && FD_ISSET(ptmfd, &wset))
       if (0 != write_and_scan_from(buffer_from_clt, &from_clt_sz, &ptmfd, &seq_from_clt)) break;
     if (IS_SELECTABLE(stdout_fileno) && FD_ISSET(stdout_fileno, &wset))
       if (0 != write_and_scan_from(buffer_from_srv, &from_srv_sz, &stdout_fileno, &seq_from_srv)) break;
 
     if (seq_from_srv.completed) {
-      return intake_end(port, &ptmfd);
+      return intake(port, &ptmfd);
     }
   }
 
   return -1;
 }
 
+#ifdef TESTS
+# include "tests.c"
+#else
 int main(int num_args, char const **args)
 {
-//#define TESTS
-
-#ifdef TESTS
-  {
-    char const str[] =
-      "La pluie nous a débués et lavés,\n"
-      "Et le soleil desséchés et noircis.\n"
-      "  Pies, corbeaux nous ont les yeux cavés,\n"
-      "Et arraché la barbe et les sourcils.\n"
-      "  Jamais nul temps nous ne sommes assis\n"
-      "  Puis çà, puis là, comme le vent varie,\n"
-      "A son plaisir sans cesser nous charrie,\n"
-      "Plus becquetés d'oiseaux que dés à coudre.\n"
-      "  Ne soyez donc de notre confrérie;\n"
-      "Mais priez Dieu que tous nous veuille absoudre!\n";
-    size_t buf0_sz = sizeof(str);
-    char buf0[IO_BUF_SIZE];
-    memcpy(buf0, str, buf0_sz);
-    size_t buf1_sz = 0, buf2_sz = 0;
-    char buf1[IO_BUF_SIZE];
-    char buf2[IO_BUF_SIZE];
-
-    // Visual check:
-    printf("Source:\n%s\n", buf0);
-    encode(buf0, &buf0_sz, buf1, &buf1_sz);
-    assert(buf1_sz == 568);
-    printf("Encoded:\n%s\n", buf1);
-    decode(buf1, &buf1_sz, buf2, &buf2_sz);
-    assert(buf2_sz == sizeof(str));
-    printf("Decoded:\n%s\n", buf2);
-    assert(0 == strncmp(str, buf2, buf2_sz));
-
-    // Test all line lengths:
-    size_t len;
-    for (len = 1; len <= sizeof(str); len++) {
-      buf0_sz = len;
-      memcpy(buf0, str, buf0_sz);
-      buf1_sz = buf2_sz = 0;
-      encode(buf0, &buf0_sz, buf1, &buf1_sz);
-      assert(buf0_sz == 0);
-      decode(buf1, &buf1_sz, buf2, &buf2_sz);
-      assert(buf2_sz == len);
-      assert(0 == strncmp(str, buf2, buf2_sz));
-    }
-    printf("Line sizes from 1 to %zu OK\n", len);
-
-    // Test filling encoded buffer:
-    buf0_sz = buf1_sz = buf2_sz = 0;
-    char seq_in = 0, seq_out = 0;
-    for (int n = 0; n < 1000; n ++) {
-      // Fill input:
-      for (; buf0_sz < IO_BUF_SIZE; buf0_sz++) buf0[buf0_sz] = seq_in++;
-      encode(buf0, &buf0_sz, buf1, &buf1_sz);
-      assert(! IS_EMPTY(buf1_sz) && ! IS_FULL(buf0_sz));  // must have done something
-      decode(buf1, &buf1_sz, buf2, &buf2_sz);
-      assert(! IS_EMPTY(buf2_sz) && ! IS_FULL(buf1_sz));
-      size_t i;
-      for (i = 0; i < buf2_sz; i++) assert(buf2[i] == seq_out++);
-      buffer_shift(buf2, &buf2_sz, i);
-      assert(IS_EMPTY(buf2_sz));
-    }
-    printf("Fill test OK\n");
-  }
-  return 0;
-#endif
-
   if (num_args != 3) {
 syntax:
     assert(num_args > 0);
@@ -888,7 +1182,7 @@ syntax:
       printf(EXHAUST_BANNER "\n");
       tcdrain(STDOUT_FILENO);
       tty_noecho(STDIN_FILENO);
-      return exhaust_end(port);
+      return exhaust(port);
 
     case 'i':
     case 'I':
@@ -897,3 +1191,4 @@ syntax:
 
   goto syntax;
 }
+#endif

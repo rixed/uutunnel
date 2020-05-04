@@ -26,7 +26,7 @@ laptop $ uutunnel in 8080
 $ echo 'hello?'
 hello!
 
-# Then you can start digging to your remote service:
+# Then you can start digging toward your remote service:
 $ ssh john.doe@remote-server1.net
 server1 $ ssh john.doe@remote-server2.net
 server2 $ docker exec -ti container /bin/bash
@@ -37,9 +37,8 @@ Haha there you are eventually!
 # forward the traffic (uuencoded) to the terminal up to here.
 # But we need some program running here to read them from stdin
 # and connect to localhost for the final leg of the journey.
-# uudecode piped into nc or netcat could do that, but that's not
-# very convenient.
-# uutunnel can do this of course! but...
+# To operate the exhaust of the tunnel you need to run uutunnel
+# in _out_put mode. But...
 $ uutunnel
 uutunnel: command not found
 

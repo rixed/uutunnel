@@ -1,11 +1,3 @@
-Multichannel
-------------
-
-Multiplex several clients in a single tunnel.
-In the meantime, one could tunnel to sshd and then connect to it in order to
-benefit for proper multiplexing, I guess.
-
-
 A way to stop forwarding mode and quit
 -------------------------------------
 
